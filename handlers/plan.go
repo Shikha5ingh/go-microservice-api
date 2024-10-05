@@ -47,8 +47,15 @@ func CreatePlan(redisClient *redis.Client, validator *utils.Validator) gin.Handl
 			return
 		}
 
+		decoder := json.NewDecoder(bytes.NewReader(jsonData))
+		decoder.DisallowUnknownFields()
+
 		// Bind JSON to Plan struct using the stored body
 		var plan models.Plan
+		if err := decoder.Decode(&plan); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON payload", "details": err.Error()})
+			return
+		}
 		if err := c.ShouldBindJSON(&plan); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON payload", "details": err.Error()})
 			return
@@ -61,6 +68,16 @@ func CreatePlan(redisClient *redis.Client, validator *utils.Validator) gin.Handl
 			return
 		}
 
+		exists, err := redisClient.Exists(ctx, plan.ObjectID).Result()
+		if err != nil {
+			log.Println("Error checking if plan exists in Redis:", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check if plan exists"})
+			return
+		}
+		if exists > 0 {
+			c.JSON(http.StatusConflict, gin.H{"error": "Plan already exists"})
+			return
+		}
 		// Set the CreationDate to the current date and time
 		plan.CreationDate = time.Now().Format("01-02-2006")
 		// Generate a unique numeric ID for the plan
@@ -98,8 +115,45 @@ func CreatePlan(redisClient *redis.Client, validator *utils.Validator) gin.Handl
 	}
 }
 
+// Get All Plan handles GET /api/v1/plans
+func GetAllPlans(redisClient *redis.Client) gin.HandlerFunc {
+
+	return func(ctx *gin.Context) {
+		// Get all keys from redis
+		planKeys, err := redisClient.Keys(ctx, "*").Result()
+		if err != nil {
+			log.Println("Error retrieving plan keys from Redis:", err)
+			ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve plans"})
+			return
+		}
+		if len(planKeys) == 0 {
+			ctx.JSON(http.StatusNotFound, gin.H{"error": "No plans found"})
+			return
+		}
+
+		var plans []models.Plan
+		for _, key := range planKeys {
+			planData, err := redisClient.Get(ctx, key).Result()
+			if err != nil {
+				log.Println("Error retrieving plan from Redis:", err)
+				ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve plan"})
+				return
+			}
+			var plan models.Plan
+			if err := json.Unmarshal([]byte(planData), &plan); err != nil {
+				log.Println("Error unmarshalling plan data:", err)
+				ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unmarshal plan data"})
+				return
+			}
+			plans = append(plans, plan)
+
+		}
+		ctx.JSON(http.StatusOK, plans)
+	}
+}
+
 // GetPlan handles GET /api/v1/plans/:id
-func GetPlan(redisClient *redis.Client) gin.HandlerFunc {
+func GetPlanByID(redisClient *redis.Client) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		objectId := c.Param("id")
 		log.Println("Object ID:", objectId)
@@ -154,17 +208,23 @@ func GetPlan(redisClient *redis.Client) gin.HandlerFunc {
 func DeletePlan(redisClient *redis.Client) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		objectId := c.Param("id")
-
-		if err := redisClient.Del(ctx, objectId).Err(); err != nil {
-			if err == redis.Nil {
-				c.JSON(http.StatusNotFound, gin.H{"error": "Plan not found"})
-				return
-			}
+		log.Println("Object ID:", objectId)
+		planKeys, err := redisClient.Keys(ctx, objectId).Result()
+		if err != nil {
+			log.Println("Error retrieving plan keys from Redis:", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve plans"})
+			return
+		}
+		if len(planKeys) == 0 {
+			c.JSON(http.StatusNotFound, gin.H{"error": "No plans found for the given ID"})
+			return
+		}
+		error := redisClient.Del(ctx, objectId).Err()
+		if error != nil {
 			log.Println("Error deleting plan from Redis:", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete plan"})
 			return
 		}
-
-		c.Status(http.StatusNoContent)
+		c.JSON(http.StatusOK, gin.H{"message": "Plan deleted successfully"})
 	}
 }

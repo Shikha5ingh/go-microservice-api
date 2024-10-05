@@ -31,7 +31,8 @@ func main() {
 		plans := api.Group("/plans")
 		{
 			plans.POST("", handlers.CreatePlan(redisClient, validator))
-			plans.GET("/:id", handlers.GetPlan(redisClient))
+			plans.GET("", handlers.GetAllPlans(redisClient))
+			plans.GET("/:id", handlers.GetPlanByID(redisClient))
 			plans.DELETE("/:id", handlers.DeletePlan(redisClient))
 		}
 	}
