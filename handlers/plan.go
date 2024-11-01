@@ -148,6 +148,32 @@ func GetAllPlans(redisClient *redis.Client) gin.HandlerFunc {
 			plans = append(plans, plan)
 
 		}
+		plansData, err := json.Marshal(plans)
+		if err != nil {
+			ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Serialization error", "details": err.Error()})
+			return
+		}
+		// Generate ETag
+		hasher := sha1.New()
+		hasher.Write(plansData)
+		etag := fmt.Sprintf(`"%x"`, hasher.Sum(nil))
+
+		etag = strings.Trim(etag, "\"") // Removing quotes from the ETag
+
+		log.Println("ETag:", etag)
+		ifMatch := ctx.GetHeader("If-Match")
+		if ifMatch != "" && ifMatch != etag {
+			ctx.JSON(http.StatusPreconditionFailed, gin.H{"error": "Precondition failed"})
+			return
+		}
+
+		ifNoneMatch := ctx.GetHeader("If-None-Match")
+		if ifNoneMatch != "" && ifNoneMatch == etag {
+			ctx.Status(http.StatusNotModified)
+			return
+		}
+
+		ctx.Header("ETag", etag)
 		ctx.JSON(http.StatusOK, plans)
 	}
 }
@@ -155,9 +181,9 @@ func GetAllPlans(redisClient *redis.Client) gin.HandlerFunc {
 // GetPlan handles GET /api/v1/plans/:id
 func GetPlanByID(redisClient *redis.Client) gin.HandlerFunc {
 	return func(c *gin.Context) {
+
 		objectId := c.Param("id")
 		log.Println("Object ID:", objectId)
-
 		planData, err := redisClient.Get(ctx, objectId).Result()
 		if err == redis.Nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "Plan not found"})
@@ -172,25 +198,21 @@ func GetPlanByID(redisClient *redis.Client) gin.HandlerFunc {
 		hasher := sha1.New()
 		hasher.Write([]byte(planData))
 		etag := fmt.Sprintf(`"%x"`, hasher.Sum(nil))
+		etag = strings.Trim(etag, "\"") // Removing quotes from the ETag
+
 		log.Println("ETag:", etag)
-		ifNoneMatch := c.GetHeader("If-None-Match")
-		log.Println("If-None-Match:", ifNoneMatch)
-		log.Println(c.Request.Header)
-		// Check If-None-Match header
-		if match := c.GetHeader("If-None-Match"); match != "" {
-			matchArray := c.Request.Header["If-None-Match"]
-			match := matchArray[0]
-			etag = strings.Trim(etag, "\"") // Removing quotes from the ETag
-			log.Println("Match:", match)
-			log.Println("ETag:", etag)
-			log.Println(match == etag)
-			if match == etag {
-				c.Status(http.StatusNotModified)
-				return
-			}
+		ifMatch := c.GetHeader("If-Match")
+		if ifMatch != "" && ifMatch != etag {
+			c.JSON(http.StatusPreconditionFailed, gin.H{"error": "Precondition failed"})
+			return
 		}
 
-		// Set ETag header
+		ifNoneMatch := c.GetHeader("If-None-Match")
+		if ifNoneMatch != "" && ifNoneMatch == etag {
+			c.Status(http.StatusNotModified)
+			return
+		}
+
 		c.Header("ETag", etag)
 
 		// Return data
@@ -226,5 +248,84 @@ func DeletePlan(redisClient *redis.Client) gin.HandlerFunc {
 			return
 		}
 		c.JSON(http.StatusOK, gin.H{"message": "Plan deleted successfully"})
+	}
+}
+
+// UpdatePlan handles PATCH /api/v1/plans/:id
+func UpdatePlan(redisClient *redis.Client, validator *utils.Validator) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		objectId := c.Param("id")
+		log.Println("Object ID:", objectId)
+
+		// Read the request body and parse the JSON data into a map of partial updates
+		var patchData map[string]interface{}
+		if err := c.ShouldBindJSON(&patchData); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON payload", "details": err.Error()})
+			return
+		}
+		if len(patchData) == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Request body is empty"})
+			return
+		}
+		planData, err := redisClient.Get(ctx, objectId).Result()
+		if err == redis.Nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Plan not found"})
+			return
+		}
+		if err != nil {
+			log.Println("Error retrieving plan from Redis:", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve plan"})
+			return
+		}
+
+		var exisingPlan map[string]interface{}
+		if err := json.Unmarshal([]byte(planData), &exisingPlan); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Deserialization error", "details": err.Error()})
+			return
+		}
+		hasher := sha1.New()
+		hasher.Write([]byte(planData))
+		currentETag := fmt.Sprintf(`"%x"`, hasher.Sum(nil))
+		currentETag = strings.Trim(currentETag, "\"") // Remove quotes
+		println("Current ETag:", currentETag)
+
+		ifMatch := c.GetHeader("If-Match")
+		println("If-Match:", ifMatch)
+		if ifMatch != "" && ifMatch != currentETag {
+			c.JSON(http.StatusPreconditionFailed, gin.H{"error": "Precondition failed"})
+			return
+		}
+		ifNoneMatch := c.GetHeader("If-None-Match")
+		if ifNoneMatch != "" && ifNoneMatch == currentETag {
+			c.Status(http.StatusNotModified)
+			return
+		}
+
+		for key, value := range patchData {
+			exisingPlan[key] = value
+		}
+		exisingPlan["CreationData"] = time.Now().Format("01-02-2006")
+		updatedPlanJSON, err := json.Marshal(exisingPlan)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Serialization error", "details": err.Error()})
+			return
+		}
+		if err := validator.Validate(updatedPlanJSON); err != nil {
+			log.Println("Validation failed:", err)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Validation failed", "details": err.Error()})
+			return
+		}
+		if err := redisClient.Set(ctx, objectId, updatedPlanJSON, 0).Err(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Redis error", "details": err.Error()})
+			return
+		}
+		// Generate ETag
+		hasher = sha1.New()
+		hasher.Write(updatedPlanJSON)
+		newETag := fmt.Sprintf(`"%x"`, hasher.Sum(nil))
+		// newETag = strings.Trim(newETag, "\"") // Removing quotes from the ETag
+		c.Header("ETag", newETag)
+		c.JSON(http.StatusOK, exisingPlan)
+
 	}
 }
